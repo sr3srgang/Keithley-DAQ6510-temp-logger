@@ -1,0 +1,44 @@
+# >>>>> User parameters >>>>>
+# TC-08 Serial number
+SN = "AC161/246"
+
+# Measurement period
+period = 15  # in second
+
+# TC08 logger channels to activate & names assigned in InfluxDB
+assignments = [
+    {
+        "num": 1,
+        "name": "Ch1",
+    },
+    {
+        "num": 2,
+        "name": "Ch2",
+    },
+    {
+        "num": 3,
+        "name": "Ch3",
+    },
+    {
+        "num": 4,
+        "name": "Ch4",
+    },
+    {
+        "num": 5,
+        "name": "Ch5",
+    },
+    {
+        "num": 6,
+        "name": "Ch6",
+    },
+    {
+        "num": 7,
+        "name": "Ch7",
+    },
+    {
+        "num": 8,
+        "name": "Ch8",
+    },
+]
+
+# <<<<< User parameters <<<<<
