@@ -1,0 +1,26 @@
+#!/bin/bash -i
+# bash script to open a new terminal in Ubuntu and startup a bash script to start up a Python script
+# Intended to be run in .desktop icon and gnome-session-properties GUI ("Startup Applications Properties").
+
+
+# path to the TC08logger app folder
+# DIR_APP="##type here the path to the project folder; see README.md##"
+#e.g., DIR_APP="/home/korra/PicoLog TC-08 temp logging/TC08logger"
+DIR_APP="/home/srgang/Keithley DAQ6510 temp logger"
+
+# string of commands to run in a new terminal
+STR_CMD="cd \"$DIR_APP\"
+if [ ! -d \"$DIR_APP\" ]; then
+    read -p \"Press Enter to continue...\"
+else
+    ./Startup_bash
+
+    if [ \$? -ne 0 ]; then
+        read -p \"Press Enter to continue...\"
+    fi
+fi"
+
+# run the commands in a new terminal
+# gnome-terminal --geometry=140x16 --title="##Type here the desired title of the terminal##" -- bash -i -c "$STR_CMD"
+# e.g., gnome-terminal --title="TC08logger" -- bash -i -c "$STR_CMD"
+gnome-terminal --geometry=90x15 --title="Keithley DAQ6510 temp logger" -- bash -i -c "$STR_CMD"

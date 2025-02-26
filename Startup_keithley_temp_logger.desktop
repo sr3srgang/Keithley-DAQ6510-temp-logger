@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Name=Keithley Temp Logger
+Comment=Sr3 temp monitor with Keithley DAQ6510
+Keywords=experiment;temperature; temp; Keithley; DAQ6510; grafana; influxdb
+Exec=/home/srgang/Keithley\ DAQ6510\ temp\ logger/Startup_ubuntu
+Type=Application
+Icon=/home/srgang/Keithley DAQ6510 temp logger/icon_temp_keithley.png
+NoDisplay=false
