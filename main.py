@@ -3,8 +3,8 @@
 import vxi11
 import time
 import math
-import logging
 import traceback
+import sys
 from datetime import datetime
 from pathlib import Path
 # InfluxDB client package
@@ -12,9 +12,7 @@ from pathlib import Path
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.write_api import SYNCHRONOUS
 
-
 # >>>>> User parameters >>>>>
-
 # Keithley DAQ6510 settings
 IP = "192.168.1.25"
 VXI11_TIMEOUT = 2  # sec
@@ -60,13 +58,15 @@ ASSIGNMENTS = [
         "thermistor_model": "44008RC",
         "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
     },
+    {
+        "channel": "106",
+        "name": "Exp-side HVAC air",
+        "thermistor_connection": "7710 multiplexer",
+        "thermistor_model": "44008RC",
+        "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
+    },
 ]
-
 # <<<<< User parameters <<<<<
-
-# should not need to change the codes below
-
-
 
 # yemonitor database credentials
 url = "http://yemonitor.colorado.edu:8086"
@@ -77,6 +77,7 @@ bucket = "sr3"  # If bucket not exists, create it from the database UI.
 # Device channels for measurement
 Nch = len(ASSIGNMENTS)
 BUFFERSIZE = Nch
+BUFFERSIZE = max(BUFFERSIZE, 10)  # Ensure buffer size is valid
 CHANNELS = [ASSIGNMENT["channel"] for ASSIGNMENT in ASSIGNMENTS]
 CHSSTR = ",".join(CHANNELS)
 
@@ -85,30 +86,7 @@ def resistance_to_temperature(resistance, B, R0, T0):
     temp_K = 1 / ((1 / B) * (math.log(resistance / R0)) + (1 / T0))
     return temp_K - 273.15  # Convert to Celsius
 
-# Logging setup
-LOG_DIR = "./logs/"
-Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
-TEMP_LOG_FILE = LOG_DIR + "temp.log"
-ERROR_LOG_FILE = LOG_DIR + "error.log"
-
-# Configure loggers
-temp_logger = logging.getLogger("temperature_logger")
-error_logger = logging.getLogger("error_logger")
-
-temp_handler = logging.FileHandler(TEMP_LOG_FILE)
-temp_handler.setLevel(logging.INFO)
-temp_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-
-temp_logger.addHandler(temp_handler)
-temp_logger.setLevel(logging.INFO)
-
-error_handler = logging.FileHandler(ERROR_LOG_FILE)
-error_handler.setLevel(logging.ERROR)
-error_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-
-error_logger.addHandler(error_handler)
-
-DAQ_SN = None # serial number of DAQ
+DAQ_SN = None  # serial number of DAQ
 
 def parse_idn_response(idn_response):
     """Parses the *IDN? response string into manufacturer, model, serial number, and firmware version."""
@@ -121,9 +99,11 @@ def parse_idn_response(idn_response):
             "Firmware Version": firmware_version
         }
     except ValueError:
-        print("Error: Unexpected *IDN? response format")
+        err_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error: Unexpected *IDN? response format."
+        print(err_msg, file=sys.stdout)
+        print(err_msg, file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
         return None
-
 
 # Start measurement loop
 iteration = 0
@@ -133,7 +113,7 @@ print("Starting thermistor measurements...")
 while TOTAL_MEASUREMENTS is None or iteration < TOTAL_MEASUREMENTS:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] Iteration {iteration}:")
-
+    
     try:
         # Establish a new VXI-11 session
         daq = vxi11.Instrument(IP)
@@ -151,9 +131,9 @@ while TOTAL_MEASUREMENTS is None or iteration < TOTAL_MEASUREMENTS:
             idn_parsed = parse_idn_response(idn)
             DAQ_SN = idn_parsed["Serial Number"] if idn_parsed else "UNKNOWN"
         
-
         # Configure the measurement
         daq.write("*RST")  # Reset and configure instrument
+        daq.write("TRAC:CLE 'defbuffer1'")
         daq.write(f"TRAC:POIN {BUFFERSIZE}, 'defbuffer1'")  # Set buffer size
         daq.write("ROUT:SCAN:BUFF 'defbuffer1'")  # Assign scan buffer
         daq.write(f"FUNC 'RES', (@{CHSSTR})")  # Set function to resistance
@@ -164,12 +144,16 @@ while TOTAL_MEASUREMENTS is None or iteration < TOTAL_MEASUREMENTS:
         daq.write("INIT")
         daq.write("*WAI")
 
+        # Check number of recorded points
+        Nact = daq.ask("TRAC:ACT?")  # Query active points
+        Nact = int(float(Nact.strip()))  # Convert to int
+
         # Fetch resistance values
-        measstr = daq.ask(f"TRAC:DATA? 1, {BUFFERSIZE}")
+        measstr = daq.ask(f"TRAC:DATA? 1, {Nact}")
         resistances = [float(s) for s in measstr.split(",")]
 
-        # Process and log temperature readings
-        temps_C = [None]*Nch
+        # Process and print temperature readings
+        temps_C = [None] * Nch
         for ich, channel in enumerate(CHANNELS):
             resistance = resistances[ich]
             name = ASSIGNMENTS[ich]["name"]
@@ -177,49 +161,46 @@ while TOTAL_MEASUREMENTS is None or iteration < TOTAL_MEASUREMENTS:
             temp_C = resistance_to_temperature(resistance, **thermistor_params)
             temps_C[ich] = temp_C
 
-            # Print and log
             meas_str = f"{channel} - R={resistance:.2f} Ω, T={temp_C:.4f} °C ({name})"
-            stdout_str = f"\t{meas_str}"
-            print(stdout_str)
-            log_str = f"{timestamp} {meas_str}"
-            temp_logger.info(log_str)
-            
-        # upload results to yemonitor DB
-        # format your data to write to the database server
-        records = [None]*Nch
+            print(f"\t{meas_str}")
+
+        # Upload results to yemonitor DB
+        records = [None] * Nch
         for ich, assignment in enumerate(ASSIGNMENTS):
             temp_C = temps_C[ich]
-            record = \
-                {
-                    "measurement": "Keithley DAQ6510",
-                    "tags": {
-                        "DAQ SN": DAQ_SN,
-                        "channel": assignment["channel"],
-                        "name": assignment["name"],
-                        "thermistor connection": assignment["thermistor_connection"],
-                        "thermistor model": assignment["thermistor_model"],
-                    },
-                    "fields": {"Temp[degC]": temp_C},
-                }
+            record = {
+                "measurement": "Keithley DAQ6510",
+                "tags": {
+                    "DAQ SN": DAQ_SN,
+                    "channel": assignment["channel"],
+                    "name": assignment["name"],
+                    "thermistor connection": assignment["thermistor_connection"],
+                    "thermistor model": assignment["thermistor_model"],
+                },
+                "fields": {"Temp[degC]": temp_C},
+            }
             records[ich] = record
             
-        # send the data
         with InfluxDBClient(url=url, token=token, org=org) as client:
             with client.write_api(write_options=SYNCHRONOUS) as writer:
                 writer.write(bucket=bucket, record=records)
 
     except Exception as ex:
-        err_str = f"⚠️ Error reading thermistor data; see error.log"
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {err_str}")
-        error_logger.error(traceback.format_exc())
+        # Construct error message with timestamp.
+        err_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error reading thermistor data."
+        print(err_msg, file=sys.stdout)
+        # Also print the error message and traceback to stderr for detailed debugging.
+        print(err_msg, file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
 
     finally:
         try:
             daq.close()
-            # print("The VXI-11 session closed.")
         except Exception as e:
-            error_logger.error(f"Error closing session: {e}")
-            print(f"⚠️ Error closing session: {e}")
+            err_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error closing session: {e}"
+            print(err_msg, file=sys.stdout)
+            print(err_msg, file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
 
     iteration += 1
     time.sleep(MEASUREMENT_INTERVAL)
