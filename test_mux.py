@@ -1,74 +1,85 @@
-import vxi11
-import time
-import traceback
+#!/usr/bin/env python3
+# 2025-05-23  Resistance-test via FastAPI VXI-11 gateway
+#
+# --- What it does ---
+#   • Talks to the DAQ6510 through the FastAPI gateway, *not* vxi11.
+#   • Measures 2-wire resistance on one or more 7701 / 7710 channels.
+#   • Prints the raw resistance value(s) every few seconds.
+#
+#   All SCPI commands remain exactly:
+#     *RST
+#     SENS:FUNC 'RES',(@ch)
+#     SENS:RES:RANG 100000,(@ch)
+#     SENS:RES:NPLC 1,(@ch)
+#     ROUT:SCAN (@ch)
+#     INIT
+#     *WAI
+#     FETC?
+#   (Shortest mnemonics, no SYST:LOC.)
+
+from __future__ import annotations
+import time, requests, sys, traceback
+from datetime import datetime
+from typing import List
+
+# ──────────────── user settings ────────────────
+GATEWAY           = "http://192.168.1.13:8000"   # FastAPI base-URL
+GATEWAY_TIMEOUT   = 5.0                       # s per batch
+MEAS_INTERVAL_SEC = 5                         # pause between reads
+CHANNELS          = ["101"]                   # change / add more if you like
+# ───────────────────────────────────────────────
+
+def send_batch(cmds: List[dict]) -> List[str]:
+    """Helper: POST /send_commands and return list of responses."""
+    r = requests.post(
+        f"{GATEWAY.rstrip('/')}/send_commands",
+        json={"commands": cmds, "timeout": GATEWAY_TIMEOUT},
+        timeout=GATEWAY_TIMEOUT + 2,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload["status"] != "ok":
+        raise RuntimeError(f"Gateway error: {payload.get('message')}")
+    return [(ent.get("response") or "") for ent in payload["results"]]
+
+def measure_resistance(ch: str) -> float:
+    ch = str(ch)
+    cmds = [
+        {"cmd": "*RST",                          "query": False},
+        {"cmd": f"SENS:FUNC 'RES',(@{ch})",      "query": False},
+        {"cmd": f"SENS:RES:RANG 100000,(@{ch})", "query": False},
+        {"cmd": f"SENS:RES:NPLC 1,(@{ch})",      "query": False},
+        {"cmd": f"ROUT:SCAN (@{ch})",            "query": False},
+        {"cmd": "INIT",                          "query": False},
+        {"cmd": "*WAI",                          "query": False},
+        {"cmd": "TRAC:DATA? 1,1",                "query": True},   # unchanged original
+    ]
+    *_, data = send_batch(cmds)
+    return float(data.strip())
 
 
-# Connection setup
-DAQ6510_IP = "192.168.1.25"  # Update with actual DAQ6510 IP
-TIMEOUT_DURATION = 2  # Timeout in seconds
-# CHANNELS = ["101", "102", "103", "104", "105"]  # Multiplexer channels
-CHANNELS = ["101", "102", "103", "104"]  # Multiplexer channels
+# ───────────────────────── main loop ─────────────────────────
+idn = send_batch([{"cmd": "*IDN?", "query": True}])[0].strip()
+print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Connected via gateway – *IDN? → {idn}")
 
+print("\nStarting resistance test…  (Ctrl-C to stop)")
 try:
-    # Connect to DAQ6510
-    print(f"Connecting to DAQ6510 at {DAQ6510_IP}...")
-    daq = vxi11.Instrument(DAQ6510_IP)
-    print("A vxi11 session established.")
-    daq.timeout = TIMEOUT_DURATION
+    while True:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}]", end="")
+        for ch in CHANNELS:
+            try:
+                R = measure_resistance(ch)
+                print(f"  CH{ch}: {R:,.2f} Ω", end="")
+            except Exception as e:
+                print(f"  CH{ch}: ERROR ({e})", end="")
+        print("")        # newline
+        time.sleep(MEAS_INTERVAL_SEC)
 
-    # Test connection
-    idn = daq.ask("*IDN?")
-    if not idn:
-        raise ConnectionError("No response from DAQ6510. Check IP or network.")
-    print(f"Connected! *IDN? = {idn}")
-    
-    # configure the measurement
-    BUFFERSIZE = len(CHANNELS)
-    CHSSTR = ",".join(CHANNELS)
-    daq.write("*RST") # Reset and configure instrument
-    daq.write(f"TRAC:POIN {BUFFERSIZE}, 'defbuffer1'")
-    daq.write("ROUT:SCAN:BUFF 'defbuffer1'")
-    daq.write(f"FUNC 'RES', (@{CHSSTR})")
-    daq.write(f"ROUT:SCAN (@{CHSSTR})")
-    daq.write("ROUT:SCAN:COUN:SCAN 1")
-    
-    # start the measurement
-    daq.write("INIT")
-    daq.write("*WAI")
-    
-    # query the measurement result
-    # im_last = daq.ask("TRAC:ACT?")
-    # measstr = daq.ask("TRAC:DATA?")
-    measstr = daq.ask(f"TRAC:DATA? 1, {BUFFERSIZE}")
-    # print(measstr)
-    resistances = [float(s) for s in measstr.split(",")]
-    
-    print(resistances)
+except KeyboardInterrupt:
+    print("\nUser stopped.")
 
-except:
-    print(traceback.format_exc())
-finally:
-    try:
-        daq.close()
-        print("The vxi11 session closed.")
-    except:
-        print(traceback.format_exc())
-
-# Set function to resistance
-# daq.write("SENS:RES:RANG 100000")  # Set resistance range to 100kΩ
-# daq.write("SENS:RES:NPLC 1")  # Set integration time to 1 power line cycle
-
-
-# Loop through channels
-# for ch in CHANNELS:
-#     print(f"Measuring resistance on CH{ch}...")
-#     daq.write(f"ROUT:SCAN (@{ch})")  # Select channel
-#     daq.write("INIT")  # Start measurement
-#     daq.write("*WAI")  # Wait for completion
-#     resistance = daq.ask("FETC?")  # Fetch result
-
-#     print(f"CH{ch}: Resistance = {resistance} Ω")
-
-daq.close()
-
-print("Measurement complete.")
+except Exception:
+    msg = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ⚠️  Unhandled error"
+    print(msg, file=sys.stderr)
+    print(traceback.format_exc(), file=sys.stderr)

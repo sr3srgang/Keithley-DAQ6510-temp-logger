@@ -1,206 +1,158 @@
-# 2025/02/19: created by Joonseok Hur
+#!/usr/bin/env python3
+# 2025-02-19  created by Joonseok Hur
+# 2025-05-23  gateway edition by ChatGPT-o3
+#
+# Reads thermistor temperatures through a Keithley DAQ6510 with
+# a 7701/7710 multiplexer **via the FastAPI VXI-11 gateway** and
+# uploads them to the yemonitor InfluxDB.
 
-import vxi11
-import time
-import math
-import traceback
-import sys
+from __future__ import annotations
+import time, math, sys, traceback, requests
 from datetime import datetime
 from pathlib import Path
-# InfluxDB client package
-# pip (or conda/mamba) install influxdb-client
-from influxdb_client import InfluxDBClient
-from influxdb_client.client.write_api import SYNCHRONOUS
+from typing import List
 
-# >>>>> User parameters >>>>>
-# Keithley DAQ6510 settings
-IP = "192.168.1.25"
-VXI11_TIMEOUT = 2  # sec
+# ───────────────────────── Gateway settings ──────────────────────────
+GATEWAY      = "http://192.168.1.13:8000"     # ← FastAPI base-URL
+GATEWAY_TO   = 5.0                         # seconds per command
 
-# Measurement settings
-MEASUREMENT_INTERVAL = 5  # Seconds between measurements
-TOTAL_MEASUREMENTS = None  # Number of iterations before stopping (set to None for infinite loop)
+# Helper: atomic POST to /send_commands
+def send_batch(cmds: List[dict[str, str | bool]], timeout: float = GATEWAY_TO) -> List[str]:
+    r = requests.post(
+        f"{GATEWAY.rstrip('/')}/send_commands",
+        json={"commands": cmds, "timeout": timeout},
+        timeout=timeout + 2,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    if payload["status"] != "ok":
+        raise RuntimeError(f"Gateway error: {payload.get('message')}")
+    return [(entry.get("response") or "") for entry in payload["results"]]
 
-# Thermistor configuration
+# ────────────────────────── User parameters ─────────────────────────
+MEASUREMENT_INTERVAL = 5      # s between loops
+TOTAL_MEASUREMENTS   = None   # None → run forever
+
 ASSIGNMENTS = [
-    {
-        "channel": "101",
-        "name": "Laser-side HVAC air",
-        "thermistor_connection": "7710 multiplexer",
-        "thermistor_model": "44008RC",
-        "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
-    },
-    {
-        "channel": "102",
-        "name": "Exp-side top layer air",
-        "thermistor_connection": "7710 multiplexer",
-        "thermistor_model": "44008RC",
-        "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
-    },
-    {
-        "channel": "103",
-        "name": "Exp-side middle layer air",
-        "thermistor_connection": "7710 multiplexer",
-        "thermistor_model": "44008RC",
-        "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
-    },
-    {
-        "channel": "104",
-        "name": "Exp-side bottom layer air",
-        "thermistor_connection": "7710 multiplexer",
-        "thermistor_model": "44008RC",
-        "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
-    },
-    {
-        "channel": "105",
-        "name": "Cavity homodyne section air",
-        "thermistor_connection": "7710 multiplexer",
-        "thermistor_model": "44008RC",
-        "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
-    },
-    {
-        "channel": "106",
-        "name": "Exp-side HVAC air",
-        "thermistor_connection": "7710 multiplexer",
-        "thermistor_model": "44008RC",
-        "thermistor_params": {"B": 3775.6, "R0": 29939, "T0": 273.15 + 25},
-    },
+    # channel, description, connection, thermistor type & params
+    {"channel":"101","name":"Laser-side HVAC air",
+     "thermistor_connection":"7710 multiplexer",
+     "thermistor_model":"44008RC",
+     "thermistor_params":{"B":3775.6,"R0":29939,"T0":273.15+25}},
+    {"channel":"102","name":"Exp-side top layer air",
+     "thermistor_connection":"7710 multiplexer",
+     "thermistor_model":"44008RC",
+     "thermistor_params":{"B":3775.6,"R0":29939,"T0":273.15+25}},
+    {"channel":"103","name":"Exp-side middle layer air",
+     "thermistor_connection":"7710 multiplexer",
+     "thermistor_model":"44008RC",
+     "thermistor_params":{"B":3775.6,"R0":29939,"T0":273.15+25}},
+    {"channel":"104","name":"Exp-side bottom layer air",
+     "thermistor_connection":"7710 multiplexer",
+     "thermistor_model":"44008RC",
+     "thermistor_params":{"B":3775.6,"R0":29939,"T0":273.15+25}},
+    {"channel":"105","name":"Cavity homodyne section air",
+     "thermistor_connection":"7710 multiplexer",
+     "thermistor_model":"44008RC",
+     "thermistor_params":{"B":3775.6,"R0":29939,"T0":273.15+25}},
+    {"channel":"106","name":"Exp-side HVAC air",
+     "thermistor_connection":"7710 multiplexer",
+     "thermistor_model":"44008RC",
+     "thermistor_params":{"B":3775.6,"R0":29939,"T0":273.15+25}},
 ]
-# <<<<< User parameters <<<<<
 
-# yemonitor database credentials
-url = "http://yemonitor.colorado.edu:8086"
-token = "yelabtoken"
-org = "yelab"
-bucket = "sr3"  # If bucket not exists, create it from the database UI.
+# ─────────────── InfluxDB (yemonitor) credentials ───────────────────
+url    = "http://yemonitor.colorado.edu:8086"
+token  = "yelabtoken"
+org    = "yelab"
+bucket = "sr3"
 
-# Device channels for measurement
-Nch = len(ASSIGNMENTS)
-BUFFERSIZE = Nch
-BUFFERSIZE = max(BUFFERSIZE, 10)  # Ensure buffer size is valid
-CHANNELS = [ASSIGNMENT["channel"] for ASSIGNMENT in ASSIGNMENTS]
-CHSSTR = ",".join(CHANNELS)
+from influxdb_client import InfluxDBClient       # noqa: E402
+from influxdb_client.client.write_api import SYNCHRONOUS  # noqa: E402
 
-# Function to convert resistance to temperature
-def resistance_to_temperature(resistance, B, R0, T0):
-    temp_K = 1 / ((1 / B) * (math.log(resistance / R0)) + (1 / T0))
-    return temp_K - 273.15  # Convert to Celsius
+# ────────────────────── derived constants ───────────────────────────
+NCH        = len(ASSIGNMENTS)
+BUFFERSIZE = max(NCH, 10)                # DAQ buffer size
+CHANNELS   = [a["channel"] for a in ASSIGNMENTS]
+CHSSTR     = ",".join(CHANNELS)
 
-DAQ_SN = None  # serial number of DAQ
+# ─────────────────── helper: R → °C for 44008RC ─────────────────────
+def R_to_T(resistance: float, *, B: float, R0: float, T0: float) -> float:
+    """Steinhart–Hart (β-form) conversion, returns °C."""
+    temp_K = 1 / ((1 / B) * math.log(resistance / R0) + 1 / T0)
+    return temp_K - 273.15
 
-def parse_idn_response(idn_response):
-    """Parses the *IDN? response string into manufacturer, model, serial number, and firmware version."""
-    try:
-        manufacturer, model, serial_number, firmware_version = idn_response.strip().split(",")
-        return {
-            "Manufacturer": manufacturer,
-            "Model": model,
-            "Serial Number": serial_number,
-            "Firmware Version": firmware_version
-        }
-    except ValueError:
-        err_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error: Unexpected *IDN? response format."
-        print(err_msg, file=sys.stdout)
-        print(err_msg, file=sys.stderr)
-        print(traceback.format_exc(), file=sys.stderr)
-        return None
+# ─────────────────────── diagnose connection once ───────────────────
+IDN = send_batch([{"cmd": "*IDN?", "query": True}])[0].strip()
+print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Connected via gateway – *IDN? → {IDN}")
+try:
+    DAQ_SN = IDN.split(",")[2]
+except Exception:
+    DAQ_SN = "UNKNOWN"
 
-# Start measurement loop
+# ───────────────────────── main measurement loop ────────────────────
 iteration = 0
-
-print("Starting thermistor measurements...")
+print("Starting thermistor measurements…")
 
 while TOTAL_MEASUREMENTS is None or iteration < TOTAL_MEASUREMENTS:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] Iteration {iteration}:")
-    
+    t0 = datetime.now()
+    print(f"[{t0:%Y-%m-%d %H:%M:%S}] Iteration {iteration}:")
+
     try:
-        # Establish a new VXI-11 session
-        daq = vxi11.Instrument(IP)
-        daq.timeout = VXI11_TIMEOUT
+        # -------- build full command batch (same sequence as before) ----------
+        cmds = [
+            {"cmd": "*RST",                                   "query": False},
+            {"cmd": "TRAC:CLE 'defbuffer1'",                  "query": False},
+            {"cmd": f"TRAC:POIN {BUFFERSIZE},'defbuffer1'",   "query": False},
+            {"cmd": "ROUT:SCAN:BUFF 'defbuffer1'",            "query": False},
+            {"cmd": f"FUNC 'RES', (@{CHSSTR})",               "query": False},
+            {"cmd": f"ROUT:SCAN (@{CHSSTR})",                 "query": False},
+            {"cmd": "ROUT:SCAN:COUN 1",                       "query": False},
+            {"cmd": "INIT",                                   "query": False},
+            {"cmd": "*WAI",                                   "query": False},
+            {"cmd": "TRAC:ACT?",                              "query": True},   # active points
+            {"cmd": f"TRAC:DATA? 1,{NCH}",                    "query": True},   # readings
+        ]
 
-        # Test connection
-        if iteration == 0:
-            print("Printing connection status in the first loop run:")
-            print(f"\tConnecting to DAQ6510 at {IP}...")
-        idn = daq.ask("*IDN?")
-        if not idn:
-            raise ConnectionError("No response from DAQ6510. Check IP or network.")
-        if iteration == 0:
-            print(f"\tConnected! *IDN? = {idn}")
-            idn_parsed = parse_idn_response(idn)
-            DAQ_SN = idn_parsed["Serial Number"] if idn_parsed else "UNKNOWN"
-        
-        # Configure the measurement
-        daq.write("*RST")  # Reset and configure instrument
-        daq.write("TRAC:CLE 'defbuffer1'")
-        daq.write(f"TRAC:POIN {BUFFERSIZE}, 'defbuffer1'")  # Set buffer size
-        daq.write("ROUT:SCAN:BUFF 'defbuffer1'")  # Assign scan buffer
-        daq.write(f"FUNC 'RES', (@{CHSSTR})")  # Set function to resistance
-        daq.write(f"ROUT:SCAN (@{CHSSTR})")  # Set channels for scanning
-        daq.write("ROUT:SCAN:COUN:SCAN 1")  # Set scan count
+        resp = send_batch(cmds)
+        Nact = int(float(resp[-2].strip()))
+        measstr = resp[-1].strip()
+        resistances = [float(s) for s in measstr.split(",")][:Nact]
 
-        # Start the measurement
-        daq.write("INIT")
-        daq.write("*WAI")
+        # -------- convert to temperatures & print ----------------------------
+        temps_C = []
+        for ich, a in enumerate(ASSIGNMENTS):
+            R = resistances[ich]
+            T = R_to_T(R, **a["thermistor_params"])
+            temps_C.append(T)
+            print(f"\t{a['channel']}  R={R:,.2f} Ω  →  {T:.3f} °C  ({a['name']})")
 
-        # Check number of recorded points
-        Nact = daq.ask("TRAC:ACT?")  # Query active points
-        Nact = int(float(Nact.strip()))  # Convert to int
-
-        # Fetch resistance values
-        measstr = daq.ask(f"TRAC:DATA? 1, {Nact}")
-        resistances = [float(s) for s in measstr.split(",")]
-
-        # Process and print temperature readings
-        temps_C = [None] * Nch
-        for ich, channel in enumerate(CHANNELS):
-            resistance = resistances[ich]
-            name = ASSIGNMENTS[ich]["name"]
-            thermistor_params = ASSIGNMENTS[ich]["thermistor_params"]
-            temp_C = resistance_to_temperature(resistance, **thermistor_params)
-            temps_C[ich] = temp_C
-
-            meas_str = f"{channel} - R={resistance:.2f} Ω, T={temp_C:.4f} °C ({name})"
-            print(f"\t{meas_str}")
-
-        # Upload results to yemonitor DB
-        records = [None] * Nch
-        for ich, assignment in enumerate(ASSIGNMENTS):
-            temp_C = temps_C[ich]
-            record = {
+        # -------- upload to InfluxDB -----------------------------------------
+        records = [
+            {
                 "measurement": "Keithley DAQ6510",
                 "tags": {
                     "DAQ SN": DAQ_SN,
-                    "channel": assignment["channel"],
-                    "name": assignment["name"],
-                    "thermistor connection": assignment["thermistor_connection"],
-                    "thermistor model": assignment["thermistor_model"],
+                    "channel": a["channel"],
+                    "name": a["name"],
+                    "thermistor connection": a["thermistor_connection"],
+                    "thermistor model": a["thermistor_model"],
                 },
-                "fields": {"Temp[degC]": temp_C},
+                "fields": {"Temp[degC]": temps_C[i]},
             }
-            records[ich] = record
-            
+            for i, a in enumerate(ASSIGNMENTS)
+        ]
+
         with InfluxDBClient(url=url, token=token, org=org) as client:
             with client.write_api(write_options=SYNCHRONOUS) as writer:
                 writer.write(bucket=bucket, record=records)
 
     except Exception as ex:
-        # Construct error message with timestamp.
-        err_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error reading thermistor data."
-        print(err_msg, file=sys.stdout)
-        # Also print the error message and traceback to stderr for detailed debugging.
-        print(err_msg, file=sys.stderr)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"[{ts}] ⚠️  Error in measurement loop"
+        print(msg, file=sys.stdout)
+        print(msg, file=sys.stderr)
         print(traceback.format_exc(), file=sys.stderr)
-
-    finally:
-        try:
-            daq.close()
-        except Exception as e:
-            err_msg = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Error closing session: {e}"
-            print(err_msg, file=sys.stdout)
-            print(err_msg, file=sys.stderr)
-            print(traceback.format_exc(), file=sys.stderr)
 
     iteration += 1
     time.sleep(MEASUREMENT_INTERVAL)
